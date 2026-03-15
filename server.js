@@ -10,8 +10,8 @@ const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN)
 
 const PORT = process.env.PORT || 4242
 const TELEGRAM_WEBHOOK_PATH = '/telegram-webhook'
-
-app.use(express.json())
+const STRIPE_WEBHOOK_PATH = '/stripe-webhook'
+const TELEGRAM_INVITE_LINK = process.env.TELEGRAM_INVITE_LINK
 
 function buildSubscribeButton(sessionUrl) {
   return {
@@ -21,6 +21,21 @@ function buildSubscribeButton(sessionUrl) {
           {
             text: 'Subscribe Now',
             url: sessionUrl,
+          },
+        ],
+      ],
+    },
+  }
+}
+
+function buildJoinGroupButton() {
+  return {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: 'Join Private Group',
+            url: TELEGRAM_INVITE_LINK,
           },
         ],
       ],
@@ -46,6 +61,58 @@ async function buildCheckoutSession(telegramUserId) {
   })
 }
 
+// Stripe webhook must use raw body
+app.post(
+  STRIPE_WEBHOOK_PATH,
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    const signature = req.headers['stripe-signature']
+
+    let event
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      )
+    } catch (error) {
+      console.error('Stripe webhook signature verification failed:', error.message)
+      return res.status(400).send(`Webhook Error: ${error.message}`)
+    }
+
+    try {
+      console.log('Stripe event received:', event.type)
+
+      if (event.type === 'checkout.session.completed') {
+        const session = event.data.object
+        const telegramUserId = session.metadata?.telegramUserId
+
+        if (!telegramUserId) {
+          console.error('No telegramUserId found in Stripe session metadata')
+          return res.status(200).json({ received: true, warning: 'Missing telegramUserId' })
+        }
+
+        await bot.sendMessage(
+          telegramUserId,
+          '✅ Payment received successfully.\n\nTap the button below to join the private Telegram group:',
+          buildJoinGroupButton()
+        )
+
+        console.log('Invite link sent to Telegram user:', telegramUserId)
+      }
+
+      return res.status(200).json({ received: true })
+    } catch (error) {
+      console.error('Stripe webhook handling error:', error)
+      return res.status(500).json({ error: 'Webhook handler failed' })
+    }
+  }
+)
+
+// Normal JSON for everything else
+app.use(express.json())
+
 app.get('/', (req, res) => {
   res.send('Telegram paid group server is running')
 })
@@ -63,7 +130,8 @@ app.get('/health', (req, res) => {
     ok: true,
     message: 'Server is healthy',
     domain: process.env.DOMAIN,
-    webhookPath: TELEGRAM_WEBHOOK_PATH,
+    telegramWebhook: `${process.env.DOMAIN}${TELEGRAM_WEBHOOK_PATH}`,
+    stripeWebhook: `${process.env.DOMAIN}${STRIPE_WEBHOOK_PATH}`,
   })
 })
 
@@ -72,7 +140,7 @@ app.get('/set-webhook', async (req, res) => {
     const webhookUrl = `${process.env.DOMAIN}${TELEGRAM_WEBHOOK_PATH}`
     const result = await bot.setWebHook(webhookUrl)
 
-    console.log('Webhook manually set:', webhookUrl)
+    console.log('Telegram webhook set:', webhookUrl)
 
     res.json({
       ok: true,
@@ -80,7 +148,7 @@ app.get('/set-webhook', async (req, res) => {
       result,
     })
   } catch (error) {
-    console.error('Failed to set webhook:', error)
+    console.error('Failed to set Telegram webhook:', error)
     res.status(500).json({
       ok: false,
       error: error.message,
@@ -135,8 +203,6 @@ app.post(TELEGRAM_WEBHOOK_PATH, (req, res) => {
 
 bot.onText(/\/start/, async (msg) => {
   try {
-    console.log('/start received from:', msg.from?.id)
-
     const chatId = msg.chat.id
     const telegramUserId = msg.from?.id
     const firstName = msg.from?.first_name || 'there'
@@ -149,7 +215,7 @@ bot.onText(/\/start/, async (msg) => {
       buildSubscribeButton(session.url)
     )
 
-    console.log('/start handled successfully for:', telegramUserId)
+    console.log('/start handled for:', telegramUserId)
   } catch (error) {
     console.error('/start error:', error)
 
@@ -166,8 +232,6 @@ bot.onText(/\/start/, async (msg) => {
 
 bot.onText(/\/pay/, async (msg) => {
   try {
-    console.log('/pay received from:', msg.from?.id)
-
     const chatId = msg.chat.id
     const telegramUserId = msg.from?.id
 
@@ -179,7 +243,7 @@ bot.onText(/\/pay/, async (msg) => {
       buildSubscribeButton(session.url)
     )
 
-    console.log('/pay handled successfully for:', telegramUserId)
+    console.log('/pay handled for:', telegramUserId)
   } catch (error) {
     console.error('/pay error:', error)
 
