@@ -7,9 +7,8 @@ const TelegramBot = require('node-telegram-bot-api')
 const app = express()
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY)
 
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, {
-  polling: true,
-})
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN)
+const TELEGRAM_WEBHOOK_PATH = '/telegram-webhook'
 
 app.use(express.json())
 
@@ -75,6 +74,11 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 })
 
+app.post(TELEGRAM_WEBHOOK_PATH, (req, res) => {
+  bot.processUpdate(req.body)
+  res.sendStatus(200)
+})
+
 bot.onText(/\/start/, async (msg) => {
   try {
     const chatId = msg.chat.id
@@ -118,11 +122,16 @@ bot.onText(/\/pay/, async (msg) => {
   }
 })
 
-bot.on('polling_error', (error) => {
-  console.error('Telegram polling error:', error)
-})
-
 const PORT = process.env.PORT || 4242
-app.listen(PORT, () => {
+
+app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`)
+
+  try {
+    const webhookUrl = `${process.env.DOMAIN}${TELEGRAM_WEBHOOK_PATH}`
+    await bot.setWebHook(webhookUrl)
+    console.log(`Telegram webhook set to ${webhookUrl}`)
+  } catch (error) {
+    console.error('Failed to set Telegram webhook:', error)
+  }
 })
