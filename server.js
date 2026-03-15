@@ -3,6 +3,8 @@ require('dotenv').config()
 const express = require('express')
 const Stripe = require('stripe')
 const TelegramBot = require('node-telegram-bot-api')
+const sqlite3 = require('sqlite3').verbose()
+const path = require('path')
 
 const app = express()
 const stripe = Stripe(process.env.STRIPE_SECRET_KEY)
@@ -12,6 +14,63 @@ const PORT = process.env.PORT || 4242
 const TELEGRAM_WEBHOOK_PATH = '/telegram-webhook'
 const STRIPE_WEBHOOK_PATH = '/stripe-webhook'
 const TELEGRAM_INVITE_LINK = process.env.TELEGRAM_INVITE_LINK
+
+const dbPath = path.join(__dirname, 'subscribers.db')
+const db = new sqlite3.Database(dbPath)
+
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS subscribers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_user_id TEXT UNIQUE,
+      telegram_username TEXT,
+      stripe_customer_id TEXT,
+      stripe_subscription_id TEXT,
+      stripe_checkout_session_id TEXT,
+      subscription_status TEXT,
+      current_period_end TEXT,
+      has_access INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `)
+})
+
+function runQuery(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function (error) {
+      if (error) {
+        reject(error)
+      } else {
+        resolve(this)
+      }
+    })
+  })
+}
+
+function getQuery(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (error, row) => {
+      if (error) {
+        reject(error)
+      } else {
+        resolve(row)
+      }
+    })
+  })
+}
+
+function allQuery(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (error, rows) => {
+      if (error) {
+        reject(error)
+      } else {
+        resolve(rows)
+      }
+    })
+  })
+}
 
 function buildSubscribeButton(sessionUrl) {
   return {
@@ -43,6 +102,37 @@ function buildJoinGroupButton() {
   }
 }
 
+async function ensureSubscriberExists(telegramUserId, telegramUsername = null) {
+  const existing = await getQuery(
+    `SELECT * FROM subscribers WHERE telegram_user_id = ?`,
+    [String(telegramUserId)]
+  )
+
+  if (!existing) {
+    await runQuery(
+      `
+      INSERT INTO subscribers (
+        telegram_user_id,
+        telegram_username,
+        subscription_status,
+        has_access
+      )
+      VALUES (?, ?, ?, ?)
+      `,
+      [String(telegramUserId), telegramUsername, 'pending', 0]
+    )
+  } else if (telegramUsername && telegramUsername !== existing.telegram_username) {
+    await runQuery(
+      `
+      UPDATE subscribers
+      SET telegram_username = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE telegram_user_id = ?
+      `,
+      [telegramUsername, String(telegramUserId)]
+    )
+  }
+}
+
 async function buildCheckoutSession(telegramUserId) {
   return stripe.checkout.sessions.create({
     mode: 'subscription',
@@ -61,7 +151,6 @@ async function buildCheckoutSession(telegramUserId) {
   })
 }
 
-// Stripe webhook must use raw body
 app.post(
   STRIPE_WEBHOOK_PATH,
   express.raw({ type: 'application/json' }),
@@ -90,7 +179,53 @@ app.post(
 
         if (!telegramUserId) {
           console.error('No telegramUserId found in Stripe session metadata')
-          return res.status(200).json({ received: true, warning: 'Missing telegramUserId' })
+          return res.status(200).json({ received: true })
+        }
+
+        await runQuery(
+          `
+          UPDATE subscribers
+          SET
+            stripe_customer_id = ?,
+            stripe_checkout_session_id = ?,
+            subscription_status = ?,
+            has_access = ?,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE telegram_user_id = ?
+          `,
+          [
+            session.customer || null,
+            session.id || null,
+            'checkout_completed',
+            1,
+            String(telegramUserId),
+          ]
+        )
+
+        if (session.subscription) {
+          const subscription = await stripe.subscriptions.retrieve(session.subscription)
+
+          await runQuery(
+            `
+            UPDATE subscribers
+            SET
+              stripe_subscription_id = ?,
+              subscription_status = ?,
+              current_period_end = ?,
+              has_access = ?,
+              updated_at = CURRENT_TIMESTAMP
+            WHERE telegram_user_id = ?
+            `,
+            [
+              subscription.id || null,
+              subscription.status || 'active',
+              subscription.current_period_end
+                ? new Date(subscription.current_period_end * 1000).toISOString()
+                : null,
+              subscription.status === 'active' ? 1 : 0,
+              String(telegramUserId),
+            ]
+          )
         }
 
         await bot.sendMessage(
@@ -110,7 +245,6 @@ app.post(
   }
 )
 
-// Normal JSON for everything else
 app.use(express.json())
 
 app.get('/', (req, res) => {
@@ -125,14 +259,50 @@ app.get('/cancel', (req, res) => {
   res.send('Payment cancelled.')
 })
 
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    message: 'Server is healthy',
-    domain: process.env.DOMAIN,
-    telegramWebhook: `${process.env.DOMAIN}${TELEGRAM_WEBHOOK_PATH}`,
-    stripeWebhook: `${process.env.DOMAIN}${STRIPE_WEBHOOK_PATH}`,
-  })
+app.get('/health', async (req, res) => {
+  try {
+    const countRow = await getQuery(`SELECT COUNT(*) as count FROM subscribers`)
+
+    res.json({
+      ok: true,
+      message: 'Server is healthy',
+      domain: process.env.DOMAIN,
+      telegramWebhook: `${process.env.DOMAIN}${TELEGRAM_WEBHOOK_PATH}`,
+      stripeWebhook: `${process.env.DOMAIN}${STRIPE_WEBHOOK_PATH}`,
+      subscribersCount: countRow?.count || 0,
+    })
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    })
+  }
+})
+
+app.get('/subscribers', async (req, res) => {
+  try {
+    const rows = await allQuery(`
+      SELECT
+        telegram_user_id,
+        telegram_username,
+        stripe_customer_id,
+        stripe_subscription_id,
+        subscription_status,
+        current_period_end,
+        has_access,
+        created_at,
+        updated_at
+      FROM subscribers
+      ORDER BY created_at DESC
+    `)
+
+    res.json(rows)
+  } catch (error) {
+    res.status(500).json({
+      ok: false,
+      error: error.message,
+    })
+  }
 })
 
 app.get('/set-webhook', async (req, res) => {
@@ -179,6 +349,8 @@ app.post('/create-checkout-session', async (req, res) => {
       })
     }
 
+    await ensureSubscriberExists(telegramUserId)
+
     const session = await buildCheckoutSession(telegramUserId)
 
     res.json({ url: session.url })
@@ -205,7 +377,10 @@ bot.onText(/\/start/, async (msg) => {
   try {
     const chatId = msg.chat.id
     const telegramUserId = msg.from?.id
+    const telegramUsername = msg.from?.username || null
     const firstName = msg.from?.first_name || 'there'
+
+    await ensureSubscriberExists(telegramUserId, telegramUsername)
 
     const session = await buildCheckoutSession(telegramUserId)
 
@@ -234,6 +409,9 @@ bot.onText(/\/pay/, async (msg) => {
   try {
     const chatId = msg.chat.id
     const telegramUserId = msg.from?.id
+    const telegramUsername = msg.from?.username || null
+
+    await ensureSubscriberExists(telegramUserId, telegramUsername)
 
     const session = await buildCheckoutSession(telegramUserId)
 
@@ -255,6 +433,34 @@ bot.onText(/\/pay/, async (msg) => {
     } catch (sendError) {
       console.error('Failed sending /pay error message:', sendError)
     }
+  }
+})
+
+bot.onText(/\/status/, async (msg) => {
+  try {
+    const telegramUserId = String(msg.from?.id)
+
+    const subscriber = await getQuery(
+      `SELECT * FROM subscribers WHERE telegram_user_id = ?`,
+      [telegramUserId]
+    )
+
+    if (!subscriber) {
+      return bot.sendMessage(
+        msg.chat.id,
+        'No subscription record found yet. Use /start to begin.'
+      )
+    }
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `Subscription status: ${subscriber.subscription_status || 'unknown'}\nAccess: ${
+        subscriber.has_access ? 'yes' : 'no'
+      }`
+    )
+  } catch (error) {
+    console.error('/status error:', error)
+    await bot.sendMessage(msg.chat.id, 'Sorry, I could not check your status.')
   }
 })
 
