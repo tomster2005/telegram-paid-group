@@ -18,58 +18,32 @@ const TELEGRAM_INVITE_LINK = process.env.TELEGRAM_INVITE_LINK
 const dbPath = path.join(__dirname, 'subscribers.db')
 const db = new Database(dbPath)
 
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS subscribers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      telegram_user_id TEXT UNIQUE,
-      telegram_username TEXT,
-      stripe_customer_id TEXT,
-      stripe_subscription_id TEXT,
-      stripe_checkout_session_id TEXT,
-      subscription_status TEXT,
-      current_period_end TEXT,
-      has_access INTEGER DEFAULT 0,
-      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-    )
-  `)
-})
+db.exec(`
+  CREATE TABLE IF NOT EXISTS subscribers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id TEXT UNIQUE,
+    telegram_username TEXT,
+    stripe_customer_id TEXT,
+    stripe_subscription_id TEXT,
+    stripe_checkout_session_id TEXT,
+    subscription_status TEXT,
+    current_period_end TEXT,
+    has_access INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )
+`)
 
 function runQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (error) {
-      if (error) {
-        reject(error)
-      } else {
-        resolve(this)
-      }
-    })
-  })
+  return Promise.resolve(db.prepare(sql).run(params))
 }
 
 function getQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (error, row) => {
-      if (error) {
-        reject(error)
-      } else {
-        resolve(row)
-      }
-    })
-  })
+  return Promise.resolve(db.prepare(sql).get(params))
 }
 
 function allQuery(sql, params = []) {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (error, rows) => {
-      if (error) {
-        reject(error)
-      } else {
-        resolve(rows)
-      }
-    })
-  })
+  return Promise.resolve(db.prepare(sql).all(params))
 }
 
 function buildSubscribeButton(sessionUrl) {
