@@ -194,11 +194,19 @@ async function removeUserFromGroup(telegramUserId) {
 
     console.log('Removed user from Telegram group:', telegramUserId)
   } catch (error) {
-    console.error('Failed to remove user from Telegram group:', telegramUserId, error.message)
+    console.error(
+      'Failed to remove user from Telegram group:',
+      telegramUserId,
+      error.message
+    )
   }
 }
 
-async function ensureSubscriberExists(telegramUserId, telegramUsername = null, telegramChatId = null) {
+async function ensureSubscriberExists(
+  telegramUserId,
+  telegramUsername = null,
+  telegramChatId = null
+) {
   const existing = await getQuery(
     `SELECT * FROM subscribers WHERE telegram_user_id = ?`,
     [String(telegramUserId)]
@@ -216,7 +224,13 @@ async function ensureSubscriberExists(telegramUserId, telegramUsername = null, t
       )
       VALUES (?, ?, ?, ?, ?)
       `,
-      [String(telegramUserId), telegramChatId ? String(telegramChatId) : null, telegramUsername, 'pending', 0]
+      [
+        String(telegramUserId),
+        telegramChatId ? String(telegramChatId) : null,
+        telegramUsername,
+        'pending',
+        0,
+      ]
     )
     return
   }
@@ -323,7 +337,7 @@ async function createAndSendInviteLink(telegramUserId, chatId) {
 
   await bot.sendMessage(
     chatId || Number(subscriber.telegram_chat_id) || Number(telegramUserId),
-    `✅ Your subscription is active.\n\nHere is your private invite link. It expires soon and only allows one join:`,
+    '✅ Your subscription is active.\n\nHere is your private invite link. It expires soon and only allows one join:',
     buildJoinGroupButton(inviteLink)
   )
 
@@ -393,7 +407,6 @@ async function handleCheckoutCompleted(session) {
 
   if (session.subscription) {
     const subscription = await stripe.subscriptions.retrieve(session.subscription)
-
     const isActive = hasActiveAccessStatus(subscription.status)
 
     await setSubscriberAccess({
@@ -577,6 +590,57 @@ async function handleSubscriptionDeleted(subscription) {
   }
 
   console.log('customer.subscription.deleted processed for:', telegramUserId)
+}
+
+async function handleUnauthorizedGroupJoin(msg) {
+  try {
+    const groupChatId = String(msg.chat?.id || '')
+    const newMembers = msg.new_chat_members || []
+
+    if (!groupChatId || groupChatId !== String(TELEGRAM_GROUP_CHAT_ID)) {
+      return
+    }
+
+    for (const member of newMembers) {
+      const telegramUserId = String(member.id)
+
+      if (member.is_bot) {
+        continue
+      }
+
+      const subscriber = await getSubscriberByTelegramUserId(telegramUserId)
+
+      if (!subscriber || !subscriber.has_access) {
+        console.log('Unauthorized join detected, removing user:', telegramUserId)
+
+        await removeUserFromGroup(telegramUserId)
+
+        try {
+          await bot.sendMessage(
+            Number(telegramUserId),
+            '⚠️ You were removed from the private group because you do not have an active subscription. Use /start to subscribe.'
+          )
+        } catch (error) {
+          console.error('Could not message unauthorized joined user:', error.message)
+        }
+
+        try {
+          if (ADMIN_TELEGRAM_USER_ID) {
+            await bot.sendMessage(
+              Number(ADMIN_TELEGRAM_USER_ID),
+              `Unauthorized join removed:\nuser_id: ${telegramUserId}\nname: ${member.first_name || 'unknown'}`
+            )
+          }
+        } catch (error) {
+          console.error('Could not notify admin about unauthorized join:', error.message)
+        }
+      } else {
+        console.log('Authorized subscriber joined group:', telegramUserId)
+      }
+    }
+  } catch (error) {
+    console.error('handleUnauthorizedGroupJoin error:', error)
+  }
 }
 
 app.post(
@@ -780,16 +844,20 @@ app.post('/create-checkout-session', async (req, res) => {
   }
 })
 
-app.post(TELEGRAM_WEBHOOK_PATH, (req, res) => {
-  try {
-    console.log('Telegram webhook hit')
-    bot.processUpdate(req.body)
-    res.sendStatus(200)
-  } catch (error) {
-    console.error('Error processing Telegram update:', error)
-    res.sendStatus(500)
+app.post(
+  TELEGRAM_WEBHOOK_PATH,
+  express.json(),
+  (req, res) => {
+    try {
+      console.log('Telegram webhook hit')
+      bot.processUpdate(req.body)
+      res.sendStatus(200)
+    } catch (error) {
+      console.error('Error processing Telegram update:', error)
+      res.sendStatus(500)
+    }
   }
-})
+)
 
 bot.onText(/\/start/, async (msg) => {
   try {
@@ -993,12 +1061,17 @@ bot.onText(/\/members/, async (msg) => {
   }
 })
 
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
   console.log('Message received:', {
     text: msg.text,
     from: msg.from?.id,
     chatId: msg.chat?.id,
+    newChatMembers: msg.new_chat_members?.map((m) => m.id) || [],
   })
+
+  if (msg.new_chat_members?.length) {
+    await handleUnauthorizedGroupJoin(msg)
+  }
 })
 
 app.listen(PORT, () => {
