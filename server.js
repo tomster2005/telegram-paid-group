@@ -3,7 +3,7 @@ require('dotenv').config()
 const express = require('express')
 const Stripe = require('stripe')
 const TelegramBot = require('node-telegram-bot-api')
-const sqlite3 = require('sqlite3').verbose()
+const Database = require('better-sqlite3')
 const path = require('path')
 
 const app = express()
@@ -16,7 +16,7 @@ const STRIPE_WEBHOOK_PATH = '/stripe-webhook'
 const TELEGRAM_INVITE_LINK = process.env.TELEGRAM_INVITE_LINK
 
 const dbPath = path.join(__dirname, 'subscribers.db')
-const db = new sqlite3.Database(dbPath)
+const db = new Database(dbPath)
 
 db.serialize(() => {
   db.run(`
